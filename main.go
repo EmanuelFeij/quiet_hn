@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,28 +33,26 @@ func main() {
 func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+
+		var stories []item
 		var client hn.Client
+
 		ids, err := client.TopItems()
 		if err != nil {
 			http.Error(w, "Failed to load top stories", http.StatusInternalServerError)
 			return
 		}
-		var stories []item
-		for _, id := range ids {
-			hnItem, err := client.GetItem(id)
-			if err != nil {
-				continue
-			}
-			item := parseHNItem(hnItem)
-			if isStoryLink(item) {
-				stories = append(stories, item)
-				if len(stories) >= numStories {
-					break
-				}
-			}
+
+		at := 0
+		for len(stories) < numStories {
+			need := (numStories - len(stories)) * 5 / 4
+			stories = append(stories, getItems(ids[at:at+need])...)
+			at += need
+
 		}
+
 		data := templateData{
-			Stories: stories,
+			Stories: stories[:numStories],
 			Time:    time.Now().Sub(start),
 		}
 		err = tpl.Execute(w, data)
@@ -61,6 +61,54 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 			return
 		}
 	})
+}
+
+func getItems(ids []int) []item {
+	var client hn.Client
+	stories := make([]item, 0)
+
+	type result struct {
+		idx   int
+		story item
+		err   error
+	}
+
+	ch := make(chan result)
+
+	for i := 0; i < len(ids); i++ {
+
+		go func(idx, id int) {
+			hnItem, err := client.GetItem(id)
+			if err != nil {
+				ch <- result{idx: idx, err: errors.New("something wrong getting item")}
+				return
+			}
+			item := parseHNItem(hnItem)
+			if isStoryLink(item) {
+				ch <- result{idx: idx, story: item, err: nil}
+				return
+			}
+			ch <- result{idx: idx, err: errors.New("item its not a story")}
+		}(i, ids[i])
+
+	}
+
+	var results []result
+	for i := 0; i < len(ids); i++ {
+		it := <-ch
+		if it.err == nil {
+			results = append(results, it)
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].idx < results[j].idx
+	})
+
+	for _, it := range results {
+		stories = append(stories, it.story)
+	}
+
+	return stories
 }
 
 func isStoryLink(item item) bool {
