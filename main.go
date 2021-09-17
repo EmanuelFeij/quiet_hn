@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/EmanuelFeij/quiet_hn/hn"
@@ -17,45 +18,54 @@ import (
 
 func main() {
 	// parse flags
-	var port, numStories int
+	var port, cacheExpiration, numStories int
 	flag.IntVar(&port, "port", 3000, "the port to start the web server on")
 	flag.IntVar(&numStories, "num_stories", 30, "the number of top stories to display")
+	flag.IntVar(&cacheExpiration, "cache_timer", 5, "the time that the cache takes to refresh")
 	flag.Parse()
+
+	cch := newCache(cacheExpiration + 2)
+
+	tick := time.NewTicker(time.Duration(cacheExpiration) * time.Second)
+	defer tick.Stop()
+
+	go func() {
+		for {
+			select {
+			case t := <-tick.C:
+
+				stories := refillCache(numStories + 20)
+				cch.m.Lock()
+				cch.stories = stories
+				cch.refreshDeadline()
+				cch.m.Unlock()
+				fmt.Println("Current time: ", t)
+			}
+		}
+
+	}()
 
 	tpl := template.Must(template.ParseFiles("./index.gohtml"))
 
-	http.HandleFunc("/", handler(numStories, tpl))
+	http.HandleFunc("/", handler(numStories, tpl, cch))
 
 	// Start the server
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
 
-func handler(numStories int, tpl *template.Template) http.HandlerFunc {
+func handler(numStories int, tpl *template.Template, c *cache) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
 		var stories []item
-		var client hn.Client
 
-		ids, err := client.TopItems()
-		if err != nil {
-			http.Error(w, "Failed to load top stories", http.StatusInternalServerError)
-			return
-		}
-
-		at := 0
-		for len(stories) < numStories {
-			need := (numStories - len(stories)) * 5 / 4
-			stories = append(stories, getItems(ids[at:at+need])...)
-			at += need
-
-		}
+		stories = c.getFromCache(numStories)
 
 		data := templateData{
-			Stories: stories[:numStories],
+			Stories: stories,
 			Time:    time.Now().Sub(start),
 		}
-		err = tpl.Execute(w, data)
+		err := tpl.Execute(w, data)
 		if err != nil {
 			http.Error(w, "Failed to process the template", http.StatusInternalServerError)
 			return
@@ -108,7 +118,61 @@ func getItems(ids []int) []item {
 		stories = append(stories, it.story)
 	}
 
-	return stories
+	return stories[:30]
+}
+
+type cache struct {
+	expiration int
+	deadline   time.Time
+	stories    []item
+	m          sync.Mutex
+}
+
+func newCache(expirationTime int) *cache {
+	c := &cache{
+		expiration: expirationTime,
+		deadline:   time.Now(),
+	}
+	return c
+}
+
+func refillCache(numStories int) []item {
+
+	var client hn.Client
+
+	ids, err := client.TopItems()
+	if err != nil {
+		return nil
+	}
+
+	return getItems(ids[:numStories+20])
+
+}
+
+func (c *cache) refreshDeadline() {
+
+	c.deadline = time.Now().Add(time.Duration(c.expiration) * time.Second)
+}
+
+func (c *cache) IsActive() bool {
+	return c.deadline.Sub(time.Now()) > 0
+}
+func (c *cache) getFromCache(numStories int) []item {
+	c.m.Lock()
+	defer c.m.Unlock()
+	if c.IsActive() {
+		return c.stories
+	}
+	var client hn.Client
+
+	ids, err := client.TopItems()
+	if err != nil {
+		return nil
+	}
+
+	c.stories = getItems(ids[:numStories+20])
+	c.refreshDeadline()
+	return c.stories
 }
 
 func isStoryLink(item item) bool {

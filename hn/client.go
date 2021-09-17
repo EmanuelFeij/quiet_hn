@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 )
 
 const (
@@ -13,6 +14,7 @@ const (
 
 // Client is an API client used to interact with the Hacker News API
 type Client struct {
+	m sync.Mutex
 	// unexported fields...
 	apiBase string
 }
@@ -20,6 +22,8 @@ type Client struct {
 // Making the Client zero value useful without forcing users to do something
 // like `NewClient()`
 func (c *Client) defaultify() {
+	c.m.Lock()
+	defer c.m.Unlock()
 	if c.apiBase == "" {
 		c.apiBase = apiBase
 	}
